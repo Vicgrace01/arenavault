@@ -1,16 +1,26 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { usePollar, WalletButton } from "@pollar/react";
 import { TournamentTerms } from "@/components/TournamentTerms";
 
 const STAKE = "10.00";
+const STAKE_AMOUNT_NORMALIZED = "10.0000000";
 
 const ESCROW = process.env.NEXT_PUBLIC_ESCROW_ADDRESS!;
-const WINNER = process.env.NEXT_PUBLIC_WINNER_ADDRESS!;
+const FALLBACK_WINNER = process.env.NEXT_PUBLIC_WINNER_ADDRESS!;
 
-type Phase = "idle" | "staking" | "staked" | "earning" | "settled";
+const HORIZON = "https://horizon-testnet.stellar.org";
+
+type Phase = "idle" | "partial" | "staked" | "earning" | "settled";
 type Screen = "splash" | "landing" | "app";
+
+type Stake = {
+  from: string;
+  hash: string;
+  createdAt: string;
+  amount: string;
+};
 
 function extractHash(res: any): string | null {
   return res?.hash ?? res?.txHash ?? res?.transactionHash ?? res?.id ?? null;
@@ -24,9 +34,14 @@ function explorerTx(hash: string) {
   return "https://stellar.expert/explorer/testnet/tx/" + hash;
 }
 
-function short(addr: string | undefined) {
+function short(addr: string | undefined, n = 4) {
   if (!addr) return "—";
-  return addr.slice(0, 6) + "…" + addr.slice(-4);
+  return addr.slice(0, 6) + "…" + addr.slice(-n);
+}
+
+function initialsFrom(addr: string | undefined) {
+  if (!addr) return "??";
+  return addr.slice(0, 2).toUpperCase();
 }
 
 function StatusDot({ state }: { state: "idle" | "pending" | "done" }) {
@@ -37,6 +52,84 @@ function StatusDot({ state }: { state: "idle" | "pending" | "done" }) {
       ? "bg-amber-400 animate-pulse"
       : "bg-neutral-700";
   return <span className={"inline-block h-2 w-2 rounded-full " + color} />;
+}
+
+function PlayerCard({
+  name,
+  address,
+  staked,
+  disabled,
+  busy,
+  state,
+  isCurrentUser,
+  onStake,
+}: {
+  name: string;
+  address: string | null;
+  staked: boolean;
+  disabled: boolean;
+  busy: boolean;
+  state: "idle" | "pending" | "done";
+  isCurrentUser: boolean;
+  onStake: () => void;
+}) {
+  const initials = staked
+    ? initialsFrom(address ?? undefined)
+    : name.slice(0, 2).toUpperCase();
+  const displayAddress = staked && address ? short(address, 4) : "Open seat";
+
+  return (
+    <div
+      className={
+        "rounded-xl border bg-neutral-900/60 p-4 transition-colors " +
+        (isCurrentUser && !staked
+          ? "border-emerald-700/60"
+          : "border-neutral-800")
+      }
+    >
+      <div className="flex items-center gap-3 mb-3">
+        <div
+          className={
+            "h-10 w-10 rounded-full flex items-center justify-center text-xs font-bold shrink-0 transition-colors " +
+            (staked
+              ? "bg-emerald-500 text-black"
+              : "bg-neutral-800 text-neutral-400")
+          }
+        >
+          {initials}
+        </div>
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center justify-between gap-2">
+            <p className="font-semibold truncate">
+              {name}
+              {isCurrentUser && (
+                <span className="ml-2 text-[10px] uppercase tracking-widest text-emerald-400">
+                  you
+                </span>
+              )}
+            </p>
+            <StatusDot state={state} />
+          </div>
+          <p className="text-xs text-neutral-500 font-mono truncate">
+            {displayAddress}
+          </p>
+        </div>
+      </div>
+      <button
+        onClick={onStake}
+        disabled={disabled}
+        className="w-full rounded-md bg-neutral-800 hover:bg-neutral-700 disabled:opacity-50 py-2 text-sm"
+      >
+        {staked
+          ? "Confirmed ✓"
+          : busy
+          ? "Signing…"
+          : isCurrentUser
+          ? "Stake 10 USDC"
+          : "Awaiting stake"}
+      </button>
+    </div>
+  );
 }
 
 export default function Home() {
@@ -51,19 +144,19 @@ export default function Home() {
     openWalletBalanceModal,
     login,
     logout,
-    logoutEverywhere,
   } = pollar;
 
   const [screen, setScreen] = useState<Screen>("splash");
   const [adminView, setAdminView] = useState(false);
-  const [playerAStaked, setPlayerAStaked] = useState(false);
-  const [playerBStaked, setPlayerBStaked] = useState(false);
+  const [stakes, setStakes] = useState<Stake[]>([]);
+  const [escrowBalance, setEscrowBalance] = useState<string>("0");
   const [earnPreviewed, setEarnPreviewed] = useState(false);
   const [winnerPaid, setWinnerPaid] = useState(false);
-  const [stakeTxHash, setStakeTxHash] = useState<string | null>(null);
+  const [payoutDestination, setPayoutDestination] = useState<string | null>(null);
   const [payoutTxHash, setPayoutTxHash] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [lastRefresh, setLastRefresh] = useState<number>(0);
 
   const USDC = useMemo(
     () => ({
@@ -74,24 +167,27 @@ export default function Home() {
     []
   );
 
-  const pool = (playerAStaked ? 10 : 0) + (playerBStaked ? 10 : 0);
+  const playerA = stakes[0] ?? null;
+  const playerB = stakes[1] ?? null;
+  const pool = stakes.length >= 2 ? 20 : stakes.length === 1 ? 10 : 0;
+  const unlocked = stakes.length >= 2;
 
   const phase: Phase = winnerPaid
     ? "settled"
     : earnPreviewed
     ? "earning"
-    : playerAStaked && playerBStaked
+    : unlocked
     ? "staked"
-    : playerAStaked || playerBStaked
-    ? "staking"
+    : stakes.length === 1
+    ? "partial"
     : "idle";
 
-  const stakeStateA: "idle" | "pending" | "done" = playerAStaked
+  const stakeStateA: "idle" | "pending" | "done" = playerA
     ? "done"
     : busy
     ? "pending"
     : "idle";
-  const stakeStateB: "idle" | "pending" | "done" = playerBStaked
+  const stakeStateB: "idle" | "pending" | "done" = playerB
     ? "done"
     : busy
     ? "pending"
@@ -99,13 +195,84 @@ export default function Home() {
   const earnState: "idle" | "pending" | "done" = earnPreviewed ? "done" : "idle";
   const settleState: "idle" | "pending" | "done" = winnerPaid ? "done" : "idle";
 
+  const userAddress = wallet?.address as string | undefined;
+  const isPlayerA = !!userAddress && playerA?.from === userAddress;
+  const isPlayerB = !!userAddress && playerB?.from === userAddress;
+  const userHasStaked = isPlayerA || isPlayerB;
+
   useEffect(() => {
     const t = setTimeout(() => setScreen("landing"), 2400);
     return () => clearTimeout(t);
   }, []);
 
-  async function stake(player: "A" | "B") {
+  const refresh = useCallback(async () => {
+    if (!ESCROW) return;
+    try {
+      const [acctRes, payRes] = await Promise.all([
+        fetch(`${HORIZON}/accounts/${ESCROW}`),
+        fetch(`${HORIZON}/accounts/${ESCROW}/payments?limit=50&order=asc`),
+      ]);
+
+      if (acctRes.ok) {
+        const acct = await acctRes.json();
+        const usdcBal =
+          (acct?.balances ?? []).find(
+            (b: any) =>
+              b.asset_code === "USDC" &&
+              b.asset_issuer === process.env.NEXT_PUBLIC_USDC_ISSUER
+          )?.balance ?? "0";
+        setEscrowBalance(usdcBal);
+      }
+
+      if (payRes.ok) {
+        const data = await payRes.json();
+        const records = (data?._embedded?.records ?? []) as any[];
+
+        const override =
+          typeof window !== "undefined"
+            ? localStorage.getItem("av_match_start_override")
+            : null;
+        const MATCH_START = override
+          ? new Date(override).getTime()
+          : process.env.NEXT_PUBLIC_MATCH_START
+          ? new Date(process.env.NEXT_PUBLIC_MATCH_START).getTime()
+          : 0;
+
+        const inbound = records.filter(
+          (x) =>
+            x.type === "payment" &&
+            x.asset_code === "USDC" &&
+            x.to === ESCROW &&
+            x.from !== ESCROW &&
+            x.amount === STAKE_AMOUNT_NORMALIZED &&
+            new Date(x.created_at).getTime() > MATCH_START
+        );
+        const mapped: Stake[] = inbound.map((x) => ({
+          from: x.from,
+          hash: x.transaction_hash,
+          createdAt: x.created_at,
+          amount: x.amount,
+        }));
+        setStakes(mapped);
+      }
+      setLastRefresh(Date.now());
+    } catch {
+      // ignore transient network errors
+    }
+  }, []);
+
+  useEffect(() => {
+    refresh();
+    const id = setInterval(refresh, 10000);
+    return () => clearInterval(id);
+  }, [refresh]);
+
+  async function stake() {
     if (!isAuthenticated || !wallet?.address) return;
+    if (userHasStaked) {
+      setError("You have already staked in this match.");
+      return;
+    }
     setBusy(true);
     setError(null);
     try {
@@ -121,9 +288,7 @@ export default function Home() {
           "Transaction did not return a hash. Response: " + JSON.stringify(res)
         );
       }
-      setStakeTxHash(hash);
-      if (player === "A") setPlayerAStaked(true);
-      else setPlayerBStaked(true);
+      await refresh();
     } catch (e: any) {
       console.error("[stake] error:", e);
       setError(e?.message ?? String(e));
@@ -144,16 +309,19 @@ export default function Home() {
     }
   }
 
-  async function resolveWinner() {
-    if (!isAuthenticated || !wallet?.address) return;
-    if (!WINNER) {
-      setError("Set NEXT_PUBLIC_WINNER_ADDRESS in .env.local and restart.");
+  async function resolveWinner(destination: string | null) {
+    if (!destination) {
+      setError("Pick a winner before resolving.");
       return;
     }
     setBusy(true);
     setError(null);
     try {
-      const res = await fetch("/api/payout", { method: "POST" });
+      const res = await fetch("/api/payout", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ destination }),
+      });
       const data = await res.json();
       console.log("[payout] response:", data);
       if (!res.ok || !data?.hash) {
@@ -162,7 +330,9 @@ export default function Home() {
         );
       }
       setPayoutTxHash(data.hash);
+      setPayoutDestination(destination);
       setWinnerPaid(true);
+      await refresh();
     } catch (e: any) {
       console.error("[payout] error:", e);
       setError(e?.message ?? String(e));
@@ -171,17 +341,31 @@ export default function Home() {
     }
   }
 
-  function resetDemo() {
-    setPlayerAStaked(false);
-    setPlayerBStaked(false);
+  function resetLocalState() {
     setEarnPreviewed(false);
     setWinnerPaid(false);
-    setStakeTxHash(null);
     setPayoutTxHash(null);
+    setPayoutDestination(null);
     setError(null);
+    refresh();
   }
 
-  async function handleLogin() {
+  function resetForNewMatch() {
+    const now = new Date().toISOString();
+    try {
+      localStorage.setItem("av_match_start_override", now);
+    } catch {}
+    setEarnPreviewed(false);
+    setWinnerPaid(false);
+    setPayoutTxHash(null);
+    setPayoutDestination(null);
+    setStakes([]);
+    setEscrowBalance("0");
+    setError("Match start reset to now. Starting fresh.");
+    refresh();
+  }
+
+  async function handleLoginGoogle() {
     setError(null);
     try {
       await login({ provider: "google" });
@@ -195,12 +379,8 @@ export default function Home() {
     try {
       await logout();
     } catch {}
-    setScreen("landing");
-  }
-
-  async function handleLogoutEverywhere() {
     try {
-      await logoutEverywhere();
+      localStorage.removeItem("av_match_start_override");
     } catch {}
     setScreen("landing");
   }
@@ -250,8 +430,10 @@ export default function Home() {
                 <p className="text-lg font-bold leading-tight">ArenaVault</p>
               </div>
             </div>
-            <span className="hidden sm:inline-flex items-center gap-1.5 text-xs rounded-full border border-neutral-700 bg-neutral-900 px-3 py-1.5 text-neutral-400">
-              <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" />
+            <span className="hidden sm:inline-flex items-center gap-2 text-xs rounded-full border border-neutral-700 bg-neutral-900 pl-2 pr-3 py-1.5 text-neutral-400">
+              <svg className="h-3.5 w-3.5" viewBox="0 0 24 24" fill="currentColor">
+                <path d="M12 2L4 6.5v11L12 22l8-4.5v-11L12 2zm0 2.3l5.5 3.1v.4L12 11 6.5 7.8v-.4L12 4.3zm-6 4.3v8.6l5.5 3.1v-8.6L6 8.6zm12 0l-5.5 3.1v8.6l5.5-3.1V8.6z" />
+              </svg>
               Stellar Testnet · Pollar
             </span>
           </header>
@@ -272,12 +454,30 @@ export default function Home() {
                 settles to the winner in a single Stellar transaction.
               </p>
 
-              <div className="mt-10 flex flex-wrap items-center gap-4">
+              <div className="mt-10 flex flex-col gap-3 max-w-sm">
                 {!isAuthenticated ? (
                   <button
-                    onClick={handleLogin}
-                    className="rounded-xl bg-emerald-500 hover:bg-emerald-400 text-black font-semibold px-6 py-3 text-base transition shadow-[0_0_40px_rgba(16,185,129,0.3)]"
+                    onClick={handleLoginGoogle}
+                    className="inline-flex items-center justify-center gap-3 rounded-xl bg-white hover:bg-neutral-200 text-black font-semibold px-6 py-3 text-base transition"
                   >
+                    <svg className="h-5 w-5" viewBox="0 0 24 24">
+                      <path
+                        fill="currentColor"
+                        d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"
+                      />
+                      <path
+                        fill="currentColor"
+                        d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"
+                      />
+                      <path
+                        fill="currentColor"
+                        d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"
+                      />
+                      <path
+                        fill="currentColor"
+                        d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"
+                      />
+                    </svg>
                     Continue with Google
                   </button>
                 ) : (
@@ -291,7 +491,7 @@ export default function Home() {
                 <span className="text-sm text-neutral-500">
                   {isAuthenticated && wallet?.address
                     ? "Signed in as " + short(wallet.address)
-                    : "One click · No seed phrase · Google or email"}
+                    : "One click · No seed phrase · Google login"}
                 </span>
               </div>
 
@@ -342,11 +542,15 @@ export default function Home() {
                 <div className="grid grid-cols-2 gap-3 mb-5">
                   <div className="rounded-xl border border-neutral-800 bg-neutral-900 p-4">
                     <p className="text-sm font-semibold">Player A</p>
-                    <p className="text-xs text-neutral-500">Not staked</p>
+                    <p className="text-xs text-neutral-500">
+                      {playerA ? short(playerA.from, 4) : "Open seat"}
+                    </p>
                   </div>
                   <div className="rounded-xl border border-neutral-800 bg-neutral-900 p-4">
                     <p className="text-sm font-semibold">Player B</p>
-                    <p className="text-xs text-neutral-500">Not staked</p>
+                    <p className="text-xs text-neutral-500">
+                      {playerB ? short(playerB.from, 4) : "Open seat"}
+                    </p>
                   </div>
                 </div>
                 <div className="rounded-xl border border-emerald-900/60 bg-emerald-950/40 px-5 py-4">
@@ -354,7 +558,12 @@ export default function Home() {
                     Total Prize Pool
                   </p>
                   <p className="text-4xl font-bold text-emerald-400 mt-1">
-                    20.00 <span className="text-lg">USDC</span>
+                    {pool.toFixed(2)}{" "}
+                    <span className="text-lg">USDC</span>
+                  </p>
+                  <p className="text-[10px] text-neutral-500 mt-1">
+                    Live escrow balance: {parseFloat(escrowBalance).toFixed(2)}{" "}
+                    USDC
                   </p>
                 </div>
               </div>
@@ -389,9 +598,15 @@ export default function Home() {
             </div>
           </div>
           <div className="flex items-center gap-3">
-            <span className="hidden sm:inline-flex items-center gap-1.5 text-xs rounded-full border border-neutral-700 bg-neutral-900 px-2.5 py-1 text-neutral-400">
-              <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" />
-              Stellar Testnet · Pollar
+            <span className="hidden sm:inline-flex items-center gap-2 text-xs rounded-full border border-neutral-700 bg-neutral-900 pl-2 pr-2.5 py-1 text-neutral-400">
+              <svg
+                className="h-3.5 w-3.5"
+                viewBox="0 0 24 24"
+                fill="currentColor"
+              >
+                <path d="M12 2L4 6.5v11L12 22l8-4.5v-11L12 2zm0 2.3l5.5 3.1v.4L12 11 6.5 7.8v-.4L12 4.3zm-6 4.3v8.6l5.5 3.1v-8.6L6 8.6zm12 0l-5.5 3.1v8.6l5.5-3.1V8.6z" />
+              </svg>
+              Stellar · Pollar
             </span>
             {isAuthenticated && (
               <button
@@ -403,7 +618,7 @@ export default function Home() {
                     : "border-neutral-700 bg-neutral-900 text-neutral-400 hover:text-neutral-200")
                 }
               >
-                {adminView ? "Admin view: ON" : "Admin view"}
+                {adminView ? "Admin: ON" : "Admin"}
               </button>
             )}
             <WalletButton />
@@ -431,34 +646,36 @@ export default function Home() {
               </h2>
               <p className="text-neutral-400 mt-6 max-w-lg mx-auto">
                 Pollar creates an embedded Stellar wallet for you the moment
-                you sign in. Google or email — no wallet installs, no browser
+                you sign in with Google — no wallet installs, no browser
                 extensions, no private keys to lose.
               </p>
 
-              <button
-                onClick={handleLogin}
-                className="mt-10 inline-flex items-center gap-3 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-black font-semibold px-8 py-4 text-base transition shadow-[0_0_60px_rgba(16,185,129,0.4)]"
-              >
-                <svg className="h-5 w-5" viewBox="0 0 24 24">
-                  <path
-                    fill="currentColor"
-                    d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"
-                  />
-                  <path
-                    fill="currentColor"
-                    d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"
-                  />
-                  <path
-                    fill="currentColor"
-                    d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"
-                  />
-                  <path
-                    fill="currentColor"
-                    d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"
-                  />
-                </svg>
-                Continue with Google
-              </button>
+              <div className="mt-10 flex justify-center">
+                <button
+                  onClick={handleLoginGoogle}
+                  className="inline-flex items-center justify-center gap-3 rounded-xl bg-white hover:bg-neutral-200 text-black font-semibold px-8 py-4 text-base transition"
+                >
+                  <svg className="h-5 w-5" viewBox="0 0 24 24">
+                    <path
+                      fill="currentColor"
+                      d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"
+                    />
+                    <path
+                      fill="currentColor"
+                      d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"
+                    />
+                    <path
+                      fill="currentColor"
+                      d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"
+                    />
+                    <path
+                      fill="currentColor"
+                      d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"
+                    />
+                  </svg>
+                  Continue with Google
+                </button>
+              </div>
 
               <div className="mt-10 flex flex-wrap justify-center gap-3">
                 <span className="inline-flex items-center gap-2 rounded-full border border-neutral-800 bg-neutral-900/60 px-3 py-1.5 text-xs text-neutral-400">
@@ -486,12 +703,19 @@ export default function Home() {
 
         {isAuthenticated && (
           <div className="space-y-6">
-            <section className="rounded-xl border border-neutral-800 bg-neutral-900/40 px-5 py-3 flex items-center justify-between gap-4">
-              <div className="text-xs text-neutral-500 min-w-0">
-                Connected wallet
-                <p className="font-mono text-neutral-300 text-sm truncate">
-                  {wallet?.address ?? "—"}
-                </p>
+            <section className="rounded-xl border border-neutral-800 bg-neutral-900/40 px-5 py-4 flex items-center justify-between gap-4 flex-wrap">
+              <div className="flex items-center gap-3 min-w-0">
+                <div className="h-10 w-10 rounded-full bg-gradient-to-br from-emerald-400 to-indigo-500 flex items-center justify-center text-black font-bold text-xs shrink-0">
+                  {initialsFrom(wallet?.address)}
+                </div>
+                <div className="min-w-0">
+                  <p className="text-[10px] uppercase tracking-[0.2em] text-emerald-400">
+                    Connected Player
+                  </p>
+                  <p className="font-mono text-neutral-300 text-sm truncate">
+                    {wallet?.address ?? "—"}
+                  </p>
+                </div>
               </div>
               <div className="flex items-center gap-2 shrink-0">
                 <button
@@ -508,15 +732,9 @@ export default function Home() {
                 </button>
                 <button
                   onClick={handleLogout}
-                  className="text-xs rounded-md bg-neutral-800 hover:bg-neutral-700 px-3 py-1.5"
+                  className="text-xs rounded-md bg-red-950/60 hover:bg-red-900/60 border border-red-800/60 text-red-300 px-3 py-1.5"
                 >
                   Log out
-                </button>
-                <button
-                  onClick={handleLogoutEverywhere}
-                  className="text-xs rounded-md bg-neutral-800 hover:bg-neutral-700 px-3 py-1.5"
-                >
-                  Log out everywhere
                 </button>
               </div>
             </section>
@@ -528,13 +746,17 @@ export default function Home() {
                     Organizer panel
                   </p>
                   <span className="text-xs text-neutral-500 capitalize">
-                    Phase: {phase}
+                    Phase: {phase} · refreshed{" "}
+                    {lastRefresh
+                      ? Math.floor((Date.now() - lastRefresh) / 1000) + "s ago"
+                      : "—"}
                   </span>
                 </div>
-                <div className="grid md:grid-cols-2 gap-4 text-sm">
+
+                <div className="grid md:grid-cols-2 gap-4 text-sm mb-4">
                   <div className="rounded-lg border border-neutral-800 bg-neutral-900/60 p-3">
                     <p className="text-xs text-neutral-500 mb-1">
-                      Escrow address
+                      Escrow wallet
                     </p>
                     <a
                       href={explorerAccount(ESCROW)}
@@ -544,34 +766,58 @@ export default function Home() {
                     >
                       {ESCROW}
                     </a>
+                    <p className="text-xs text-neutral-400 mt-2">
+                      Balance: {parseFloat(escrowBalance).toFixed(2)} USDC
+                    </p>
                   </div>
                   <div className="rounded-lg border border-neutral-800 bg-neutral-900/60 p-3">
                     <p className="text-xs text-neutral-500 mb-1">
-                      Winner address
+                      Winner selector
                     </p>
-                    <a
-                      href={explorerAccount(WINNER)}
-                      target="_blank"
-                      rel="noreferrer"
-                      className="font-mono text-xs text-indigo-300 break-all underline"
+                    <select
+                      className="w-full bg-neutral-950 border border-neutral-800 rounded px-2 py-1.5 text-xs font-mono"
+                      value={payoutDestination ?? ""}
+                      onChange={(e) =>
+                        setPayoutDestination(e.target.value || null)
+                      }
                     >
-                      {WINNER}
-                    </a>
+                      <option value="">— pick winner —</option>
+                      {playerA && (
+                        <option value={playerA.from}>
+                          Player A · {short(playerA.from)}
+                        </option>
+                      )}
+                      {playerB && (
+                        <option value={playerB.from}>
+                          Player B · {short(playerB.from)}
+                        </option>
+                      )}
+                      <option value={FALLBACK_WINNER}>
+                        Fallback · {short(FALLBACK_WINNER)}
+                      </option>
+                    </select>
                   </div>
                 </div>
-                <div className="mt-4 flex flex-wrap gap-2">
+
+                <div className="flex flex-wrap gap-2">
                   <button
-                    onClick={resolveWinner}
-                    disabled={busy || winnerPaid}
+                    onClick={() => resolveWinner(payoutDestination)}
+                    disabled={busy || winnerPaid || !payoutDestination}
                     className="text-xs rounded-md bg-indigo-500 hover:bg-indigo-400 disabled:bg-neutral-800 disabled:text-neutral-600 text-white font-semibold px-3 py-1.5"
                   >
-                    Force resolve winner
+                    Resolve payout
                   </button>
                   <button
-                    onClick={resetDemo}
+                    onClick={resetForNewMatch}
+                    className="text-xs rounded-md bg-emerald-500 hover:bg-emerald-400 text-black font-semibold px-3 py-1.5"
+                  >
+                    Reset for new match
+                  </button>
+                  <button
+                    onClick={resetLocalState}
                     className="text-xs rounded-md bg-neutral-800 hover:bg-neutral-700 px-3 py-1.5"
                   >
-                    Reset demo
+                    Refresh state
                   </button>
                 </div>
               </section>
@@ -593,26 +839,42 @@ export default function Home() {
               <div className="mt-6 grid grid-cols-2 gap-4">
                 <PlayerCard
                   name="Player A"
-                  staked={playerAStaked}
-                  disabled={busy || playerAStaked}
-                  busy={busy && !playerAStaked}
+                  address={playerA?.from ?? null}
+                  staked={!!playerA}
+                  disabled={busy || userHasStaked || !isAuthenticated}
+                  busy={busy && !userHasStaked}
                   state={stakeStateA}
-                  onStake={() => stake("A")}
+                  isCurrentUser={isPlayerA}
+                  onStake={stake}
                 />
                 <PlayerCard
                   name="Player B"
-                  staked={playerBStaked}
-                  disabled={busy || playerBStaked}
-                  busy={busy && !playerBStaked}
+                  address={playerB?.from ?? null}
+                  staked={!!playerB}
+                  disabled={busy || userHasStaked || !isAuthenticated}
+                  busy={busy && !userHasStaked}
                   state={stakeStateB}
-                  onStake={() => stake("B")}
+                  isCurrentUser={isPlayerB}
+                  onStake={stake}
                 />
               </div>
+              {!userHasStaked && isAuthenticated && !unlocked && (
+                <p className="text-xs text-neutral-500 mt-4 text-center">
+                  Open this page in an incognito window and sign in with a
+                  different Google account to fill the second seat.
+                </p>
+              )}
             </section>
 
             <TournamentTerms
-              unlocked={playerAStaked && playerBStaked}
-              winnerAddress={WINNER}
+              unlocked={unlocked}
+              winnerAddress={
+                payoutDestination || playerA?.from || FALLBACK_WINNER
+              }
+              escrowAddress={ESCROW}
+              stakeTimestamp={playerA?.createdAt ?? null}
+              stakeTxHash={playerA?.hash ?? null}
+              payoutTxHash={payoutTxHash}
             />
 
             <section className="rounded-2xl border border-emerald-900/60 bg-gradient-to-br from-emerald-950/40 to-neutral-950 p-6">
@@ -628,7 +890,8 @@ export default function Home() {
                   </p>
                   <p className="text-xs text-neutral-500 mt-2">
                     Held in escrow: {ESCROW.slice(0, 6)}…
-                    {ESCROW.slice(-6)}
+                    {ESCROW.slice(-6)} ·{" "}
+                    {parseFloat(escrowBalance).toFixed(2)} USDC on-chain
                   </p>
                 </div>
                 <button
@@ -654,37 +917,65 @@ export default function Home() {
                     <StatusDot state={settleState} />
                     Settlement
                   </p>
-                  <p className="text-neutral-300 text-sm mt-1">
-                    Escrow releases pool to Player A
+                  <p className="text-neutral-300 text-sm mt-1 flex items-center gap-2">
+                    {winnerPaid && payoutDestination
+                      ? "Paid to " + short(payoutDestination, 4)
+                      : unlocked
+                      ? "Ready — pick winner in Admin panel"
+                      : "Waiting for both stakes"}
+                    {busy && !winnerPaid && (
+                      <span className="inline-flex items-center gap-1 text-xs text-amber-400">
+                        <span className="h-1.5 w-1.5 rounded-full bg-amber-400 animate-pulse" />
+                        submitting
+                      </span>
+                    )}
                   </p>
                 </div>
                 <button
-                  onClick={resolveWinner}
-                  disabled={pool < 20 || winnerPaid || busy}
+                  onClick={() => {
+                    setAdminView(true);
+                    setError("Pick a winner from the Organizer panel above.");
+                  }}
+                  disabled={!unlocked || winnerPaid || busy}
                   className="rounded-lg bg-indigo-500 hover:bg-indigo-400 disabled:bg-neutral-800 disabled:text-neutral-600 text-white font-semibold px-4 py-2"
                 >
-                  {winnerPaid ? "Paid ✓" : "Resolve Winner (Player A)"}
+                  {winnerPaid ? "Paid ✓" : "Resolve Winner"}
                 </button>
               </div>
             </section>
 
-            {(stakeTxHash || payoutTxHash) && (
+            {(playerA?.hash || payoutTxHash) && (
               <section className="rounded-2xl border border-emerald-800 bg-emerald-950/30 p-6 space-y-3">
                 <p className="text-xs uppercase tracking-widest text-emerald-400">
                   On-chain proof
                 </p>
-                {stakeTxHash && (
+                {playerA?.hash && (
                   <div>
                     <p className="text-xs text-neutral-500 mb-1">
-                      Stake settlement
+                      Player A stake ({short(playerA.from)})
                     </p>
                     <a
                       className="text-emerald-300 font-mono text-xs break-all underline"
-                      href={explorerTx(stakeTxHash)}
+                      href={explorerTx(playerA.hash)}
                       target="_blank"
                       rel="noreferrer"
                     >
-                      {stakeTxHash}
+                      {playerA.hash}
+                    </a>
+                  </div>
+                )}
+                {playerB?.hash && (
+                  <div>
+                    <p className="text-xs text-neutral-500 mb-1">
+                      Player B stake ({short(playerB.from)})
+                    </p>
+                    <a
+                      className="text-emerald-300 font-mono text-xs break-all underline"
+                      href={explorerTx(playerB.hash)}
+                      target="_blank"
+                      rel="noreferrer"
+                    >
+                      {playerB.hash}
                     </a>
                   </div>
                 )}
@@ -713,14 +1004,6 @@ export default function Home() {
               >
                 Wallet balances
               </button>
-              {!adminView && (
-                <button
-                  onClick={resetDemo}
-                  className="text-xs rounded-md bg-neutral-800 hover:bg-neutral-700 px-3 py-1.5"
-                >
-                  Reset demo
-                </button>
-              )}
             </section>
 
             {error && (
@@ -736,40 +1019,5 @@ export default function Home() {
         </footer>
       </div>
     </main>
-  );
-}
-
-function PlayerCard({
-  name,
-  staked,
-  disabled,
-  busy,
-  state,
-  onStake,
-}: {
-  name: string;
-  staked: boolean;
-  disabled: boolean;
-  busy: boolean;
-  state: "idle" | "pending" | "done";
-  onStake: () => void;
-}) {
-  return (
-    <div className="rounded-xl border border-neutral-800 bg-neutral-900/60 p-4">
-      <div className="flex items-center justify-between mb-1">
-        <p className="font-semibold">{name}</p>
-        <StatusDot state={state} />
-      </div>
-      <p className="text-xs text-neutral-500 mb-3">
-        {staked ? "Staked 10.00 USDC" : "Not staked"}
-      </p>
-      <button
-        onClick={onStake}
-        disabled={disabled}
-        className="w-full rounded-md bg-neutral-800 hover:bg-neutral-700 disabled:opacity-50 py-2 text-sm"
-      >
-        {staked ? "Confirmed ✓" : busy ? "Signing…" : "Stake 10 USDC"}
-      </button>
-    </div>
   );
 }
