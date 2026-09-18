@@ -11,6 +11,7 @@ import {
   Networks,
   Operation,
   Asset,
+  Memo,
 } from "@stellar/stellar-sdk";
 
 const MIN_STAKE = 0.1;
@@ -95,7 +96,7 @@ async function payWithDemoWallet(req: X402PaymentRequest) {
   );
 
   if (req.memo) {
-    builder.addMemo({ type: "text", value: req.memo } as any);
+    builder.addMemo(Memo.text(req.memo));
   }
 
   const tx = builder.setTimeout(60).build();
