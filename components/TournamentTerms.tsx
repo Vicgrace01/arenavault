@@ -1,7 +1,5 @@
 "use client";
 
-import { useState } from "react";
-
 function explorerAccount(addr: string) {
   return "https://stellar.expert/explorer/testnet/account/" + addr;
 }
@@ -105,8 +103,6 @@ export function TournamentTerms({
   payoutTxHash: string | null;
   stakeAmount: number;
 }) {
-  const [revealed, setRevealed] = useState(false);
-
   const stakeStr = stakeAmount.toFixed(2);
   const poolStr = (stakeAmount * 2).toFixed(2);
 
@@ -119,8 +115,8 @@ export function TournamentTerms({
           </p>
           <p className="text-neutral-500 text-xs mt-1">
             {unlocked
-              ? "Unlocked — both players staked"
-              : "Locked — stake to unlock the rules"}
+              ? "Revealed — both players staked"
+              : "Locked — stake to reveal the rules"}
           </p>
         </div>
         <span
@@ -131,17 +127,17 @@ export function TournamentTerms({
               : "border-neutral-700 bg-neutral-950 text-neutral-500")
           }
         >
-          {unlocked ? "Unlocked" : "Locked"}
+          {unlocked ? "Revealed" : "Locked"}
         </span>
       </div>
 
       <div className="relative">
         <div
           className={
-            "grid gap-3 md:grid-cols-2 " +
-            (unlocked && revealed
-              ? ""
-              : "blur-sm select-none pointer-events-none")
+            "grid gap-3 md:grid-cols-2 transition-all duration-500 " +
+            (unlocked
+              ? "opacity-100"
+              : "opacity-40 blur-sm select-none pointer-events-none")
           }
         >
           <Section title="1 · Committed Winner">
@@ -246,20 +242,9 @@ export function TournamentTerms({
                 Rules are hidden
               </p>
               <p className="text-xs text-neutral-500 mt-1">
-                Both players must stake before terms unlock
+                Both players must stake before terms reveal
               </p>
             </div>
-          </div>
-        )}
-
-        {unlocked && !revealed && (
-          <div className="absolute inset-0 flex items-center justify-center">
-            <button
-              onClick={() => setRevealed(true)}
-              className="rounded-lg bg-emerald-500 hover:bg-emerald-400 text-black font-semibold px-5 py-2.5"
-            >
-              Reveal tournament terms
-            </button>
           </div>
         )}
       </div>
