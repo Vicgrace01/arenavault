@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import { usePollar, WalletButton } from "@pollar/react";
+import { TournamentTerms } from "@/components/TournamentTerms";
 
 const STAKE = "10.00";
 
@@ -608,6 +609,11 @@ export default function Home() {
                 />
               </div>
             </section>
+
+            <TournamentTerms
+              unlocked={playerAStaked && playerBStaked}
+              winnerAddress={WINNER}
+            />
 
             <section className="rounded-2xl border border-emerald-900/60 bg-gradient-to-br from-emerald-950/40 to-neutral-950 p-6">
               <div className="flex items-end justify-between gap-6 flex-wrap">
