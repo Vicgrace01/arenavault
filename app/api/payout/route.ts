@@ -9,8 +9,12 @@ import {
 } from "@stellar/stellar-sdk";
 
 const USDC_ISSUER = process.env.NEXT_PUBLIC_USDC_ISSUER || "";
-const PRIZE = "20.0000000";
 const G_ADDRESS = /^G[A-Z0-9]{55}$/;
+
+function toStellarAmount(n: number): string {
+  // 7 decimals, Stellar's max precision for issued assets
+  return n.toFixed(7);
+}
 
 export async function POST(req: Request) {
   try {
@@ -19,12 +23,29 @@ export async function POST(req: Request) {
       (body?.destination as string | undefined) ||
       process.env.NEXT_PUBLIC_WINNER_ADDRESS;
 
+    const rawAmount = body?.amount;
+    const amountNum =
+      typeof rawAmount === "number"
+        ? rawAmount
+        : typeof rawAmount === "string"
+        ? parseFloat(rawAmount)
+        : NaN;
+
     if (!destination || !G_ADDRESS.test(destination)) {
       return NextResponse.json(
         { error: "Invalid or missing destination address" },
         { status: 400 }
       );
     }
+
+    if (!isFinite(amountNum) || amountNum <= 0) {
+      return NextResponse.json(
+        { error: "Invalid or missing amount" },
+        { status: 400 }
+      );
+    }
+
+    const amount = toStellarAmount(amountNum);
 
     const secret = process.env.ESCROW_SECRET;
     if (!secret) {
@@ -46,7 +67,7 @@ export async function POST(req: Request) {
         Operation.payment({
           destination,
           asset: new Asset("USDC", USDC_ISSUER),
-          amount: PRIZE,
+          amount,
         })
       )
       .setTimeout(60)
@@ -60,7 +81,7 @@ export async function POST(req: Request) {
       hash: result.hash,
       from: escrow.publicKey(),
       to: destination,
-      amount: PRIZE,
+      amount,
     });
   } catch (e: any) {
     const detail =

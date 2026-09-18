@@ -22,7 +22,10 @@ function truncate(s: string) {
 function formatTime(iso: string | null) {
   if (!iso) return "—";
   try {
-    return new Date(iso).toISOString().replace("T", " ").replace(".000Z", " UTC");
+    return new Date(iso)
+      .toISOString()
+      .replace("T", " ")
+      .replace(".000Z", " UTC");
   } catch {
     return iso;
   }
@@ -92,6 +95,7 @@ export function TournamentTerms({
   stakeTimestamp,
   stakeTxHash,
   payoutTxHash,
+  stakeAmount,
 }: {
   unlocked: boolean;
   winnerAddress: string;
@@ -99,8 +103,12 @@ export function TournamentTerms({
   stakeTimestamp: string | null;
   stakeTxHash: string | null;
   payoutTxHash: string | null;
+  stakeAmount: number;
 }) {
   const [revealed, setRevealed] = useState(false);
+
+  const stakeStr = stakeAmount.toFixed(2);
+  const poolStr = (stakeAmount * 2).toFixed(2);
 
   return (
     <section className="rounded-2xl border border-neutral-800 bg-neutral-900 p-6 relative overflow-hidden">
@@ -131,7 +139,9 @@ export function TournamentTerms({
         <div
           className={
             "grid gap-3 md:grid-cols-2 " +
-            (unlocked && revealed ? "" : "blur-sm select-none pointer-events-none")
+            (unlocked && revealed
+              ? ""
+              : "blur-sm select-none pointer-events-none")
           }
         >
           <Section title="1 · Committed Winner">
@@ -156,8 +166,11 @@ export function TournamentTerms({
           </Section>
 
           <Section title="3 · Payout Calculation">
-            <Row label="Entry fee" value="10.00 USDC per player" />
-            <Row label="Total pool" value="20.00 USDC (2 × 10.00)" />
+            <Row label="Entry fee" value={stakeStr + " USDC per player"} />
+            <Row
+              label="Total pool"
+              value={poolStr + " USDC (2 × " + stakeStr + ")"}
+            />
             <Row
               label="Platform fee"
               value="0% at hackathon · 2% mainnet roadmap"
@@ -166,7 +179,7 @@ export function TournamentTerms({
               label="Yield accrual"
               value="Mainnet only · testnet preview"
             />
-            <Row label="Winner receives" value="20.00 USDC + yield" />
+            <Row label="Winner receives" value={poolStr + " USDC + yield"} />
           </Section>
 
           <Section title="4 · Settlement Timeline">

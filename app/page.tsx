@@ -1,26 +1,28 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { usePollar, WalletButton } from "@pollar/react";
 import { TournamentTerms } from "@/components/TournamentTerms";
+import { x402Fetch, type X402PaymentRequest } from "x402-stellar-sdk/client";
+import {
+  Keypair,
+  Horizon,
+  TransactionBuilder,
+  Networks,
+  Operation,
+  Asset,
+} from "@stellar/stellar-sdk";
 
-const STAKE = "10.00";
-const STAKE_AMOUNT_NORMALIZED = "10.0000000";
+const MIN_STAKE = 0.1;
+const MAX_STAKE = 100;
+const DEFAULT_STAKE = 1;
 
 const ESCROW = process.env.NEXT_PUBLIC_ESCROW_ADDRESS!;
 const FALLBACK_WINNER = process.env.NEXT_PUBLIC_WINNER_ADDRESS!;
+const USDC_ISSUER = process.env.NEXT_PUBLIC_USDC_ISSUER!;
+const HORIZON_URL = "https://horizon-testnet.stellar.org";
 
-const HORIZON = "https://horizon-testnet.stellar.org";
-
-type Phase = "idle" | "partial" | "staked" | "earning" | "settled";
 type Screen = "splash" | "landing" | "app";
-
-type Stake = {
-  from: string;
-  hash: string;
-  createdAt: string;
-  amount: string;
-};
 
 function extractHash(res: any): string | null {
   return res?.hash ?? res?.txHash ?? res?.transactionHash ?? res?.id ?? null;
@@ -54,6 +56,55 @@ function StatusDot({ state }: { state: "idle" | "pending" | "done" }) {
   return <span className={"inline-block h-2 w-2 rounded-full " + color} />;
 }
 
+async function payWithDemoWallet(req: X402PaymentRequest) {
+  // Generate or load a demo keypair in localStorage
+  let secret = localStorage.getItem("av_x402_secret");
+  if (!secret) {
+    const kp = Keypair.random();
+    secret = kp.secret();
+    localStorage.setItem("av_x402_secret", secret);
+    localStorage.setItem("av_x402_public", kp.publicKey());
+    console.log("[x402] Generated demo wallet:", kp.publicKey());
+    console.log(
+      "[x402] Fund this address at https://faucet.circle.com (Stellar Testnet)"
+    );
+    console.log("[x402] Fund XLM via friendbot: https://friendbot.stellar.org?addr=" + kp.publicKey());
+    throw new Error(
+      "New x402 wallet created. Fund it, then click again. Address: " +
+        kp.publicKey()
+    );
+  }
+
+  const kp = Keypair.fromSecret(secret);
+  const server = new Horizon.Server(HORIZON_URL);
+  const source = await server.loadAccount(kp.publicKey());
+
+  const asset = req.issuer
+    ? new Asset(req.assetCode, req.issuer)
+    : Asset.native();
+
+  const builder = new TransactionBuilder(source, {
+    fee: "1000",
+    networkPassphrase: Networks.TESTNET,
+  }).addOperation(
+    Operation.payment({
+      destination: req.destination,
+      asset,
+      amount: req.amount,
+    })
+  );
+
+  if (req.memo) {
+    builder.addMemo({ type: "text", value: req.memo } as any);
+  }
+
+  const tx = builder.setTimeout(60).build();
+  tx.sign(kp);
+  const result = await server.submitTransaction(tx);
+
+  return { transactionHash: result.hash };
+}
+
 function PlayerCard({
   name,
   address,
@@ -61,7 +112,7 @@ function PlayerCard({
   disabled,
   busy,
   state,
-  isCurrentUser,
+  amount,
   onStake,
 }: {
   name: string;
@@ -70,7 +121,7 @@ function PlayerCard({
   disabled: boolean;
   busy: boolean;
   state: "idle" | "pending" | "done";
-  isCurrentUser: boolean;
+  amount: number;
   onStake: () => void;
 }) {
   const initials = staked
@@ -79,14 +130,7 @@ function PlayerCard({
   const displayAddress = staked && address ? short(address, 4) : "Open seat";
 
   return (
-    <div
-      className={
-        "rounded-xl border bg-neutral-900/60 p-4 transition-colors " +
-        (isCurrentUser && !staked
-          ? "border-emerald-700/60"
-          : "border-neutral-800")
-      }
-    >
+    <div className="rounded-xl border border-neutral-800 bg-neutral-900/60 p-4 transition-colors">
       <div className="flex items-center gap-3 mb-3">
         <div
           className={
@@ -100,14 +144,7 @@ function PlayerCard({
         </div>
         <div className="flex-1 min-w-0">
           <div className="flex items-center justify-between gap-2">
-            <p className="font-semibold truncate">
-              {name}
-              {isCurrentUser && (
-                <span className="ml-2 text-[10px] uppercase tracking-widest text-emerald-400">
-                  you
-                </span>
-              )}
-            </p>
+            <p className="font-semibold truncate">{name}</p>
             <StatusDot state={state} />
           </div>
           <p className="text-xs text-neutral-500 font-mono truncate">
@@ -124,9 +161,7 @@ function PlayerCard({
           ? "Confirmed ✓"
           : busy
           ? "Signing…"
-          : isCurrentUser
-          ? "Stake 10 USDC"
-          : "Awaiting stake"}
+          : "Stake " + amount.toFixed(2) + " USDC"}
       </button>
     </div>
   );
@@ -148,137 +183,129 @@ export default function Home() {
 
   const [screen, setScreen] = useState<Screen>("splash");
   const [adminView, setAdminView] = useState(false);
-  const [stakes, setStakes] = useState<Stake[]>([]);
-  const [escrowBalance, setEscrowBalance] = useState<string>("0");
+  const [playerAStaked, setPlayerAStaked] = useState(false);
+  const [playerBStaked, setPlayerBStaked] = useState(false);
   const [earnPreviewed, setEarnPreviewed] = useState(false);
   const [winnerPaid, setWinnerPaid] = useState(false);
+  const [stakeTxHash, setStakeTxHash] = useState<string | null>(null);
+  const [stakeTimestamp, setStakeTimestamp] = useState<string | null>(null);
   const [payoutDestination, setPayoutDestination] = useState<string | null>(null);
   const [payoutTxHash, setPayoutTxHash] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [lastRefresh, setLastRefresh] = useState<number>(0);
+  const [walletUsdc, setWalletUsdc] = useState<string | null>(null);
+  const [walletXlm, setWalletXlm] = useState<string | null>(null);
+  const [stakeInput, setStakeInput] = useState<string>(DEFAULT_STAKE.toFixed(2));
+  const [scoutReport, setScoutReport] = useState<any>(null);
+  const [scoutLoading, setScoutLoading] = useState(false);
+  const [x402Public, setX402Public] = useState<string | null>(null);
+
+  const stakeAmount = useMemo(() => {
+    const n = parseFloat(stakeInput);
+    if (!isFinite(n)) return 0;
+    return n;
+  }, [stakeInput]);
+
+  const stakeAmountValid =
+    stakeAmount >= MIN_STAKE && stakeAmount <= MAX_STAKE;
 
   const USDC = useMemo(
     () => ({
       type: "credit_alphanum4" as const,
       code: "USDC",
-      issuer: process.env.NEXT_PUBLIC_USDC_ISSUER!,
+      issuer: USDC_ISSUER,
     }),
     []
   );
 
-  const playerA = stakes[0] ?? null;
-  const playerB = stakes[1] ?? null;
-  const pool = stakes.length >= 2 ? 20 : stakes.length === 1 ? 10 : 0;
-  const unlocked = stakes.length >= 2;
+  const pool =
+    (playerAStaked ? stakeAmount : 0) + (playerBStaked ? stakeAmount : 0);
+  const unlocked = playerAStaked && playerBStaked;
 
-  const phase: Phase = winnerPaid
-    ? "settled"
-    : earnPreviewed
-    ? "earning"
-    : unlocked
-    ? "staked"
-    : stakes.length === 1
-    ? "partial"
-    : "idle";
-
-  const stakeStateA: "idle" | "pending" | "done" = playerA
-    ? "done"
-    : busy
-    ? "pending"
-    : "idle";
-  const stakeStateB: "idle" | "pending" | "done" = playerB
-    ? "done"
-    : busy
-    ? "pending"
-    : "idle";
-  const earnState: "idle" | "pending" | "done" = earnPreviewed ? "done" : "idle";
-  const settleState: "idle" | "pending" | "done" = winnerPaid ? "done" : "idle";
-
-  const userAddress = wallet?.address as string | undefined;
-  const isPlayerA = !!userAddress && playerA?.from === userAddress;
-  const isPlayerB = !!userAddress && playerB?.from === userAddress;
-  const userHasStaked = isPlayerA || isPlayerB;
+  const usdcNum = walletUsdc === null ? null : parseFloat(walletUsdc);
+  const hasEnoughUsdcForStake =
+    usdcNum === null ? true : usdcNum >= stakeAmount;
 
   useEffect(() => {
     const t = setTimeout(() => setScreen("landing"), 2400);
     return () => clearTimeout(t);
   }, []);
 
-  const refresh = useCallback(async () => {
-    if (!ESCROW) return;
-    try {
-      const [acctRes, payRes] = await Promise.all([
-        fetch(`${HORIZON}/accounts/${ESCROW}`),
-        fetch(`${HORIZON}/accounts/${ESCROW}/payments?limit=50&order=asc`),
-      ]);
-
-      if (acctRes.ok) {
-        const acct = await acctRes.json();
-        const usdcBal =
-          (acct?.balances ?? []).find(
-            (b: any) =>
-              b.asset_code === "USDC" &&
-              b.asset_issuer === process.env.NEXT_PUBLIC_USDC_ISSUER
-          )?.balance ?? "0";
-        setEscrowBalance(usdcBal);
-      }
-
-      if (payRes.ok) {
-        const data = await payRes.json();
-        const records = (data?._embedded?.records ?? []) as any[];
-
-        const override =
-          typeof window !== "undefined"
-            ? localStorage.getItem("av_match_start_override")
-            : null;
-        const MATCH_START = override
-          ? new Date(override).getTime()
-          : process.env.NEXT_PUBLIC_MATCH_START
-          ? new Date(process.env.NEXT_PUBLIC_MATCH_START).getTime()
-          : 0;
-
-        const inbound = records.filter(
-          (x) =>
-            x.type === "payment" &&
-            x.asset_code === "USDC" &&
-            x.to === ESCROW &&
-            x.from !== ESCROW &&
-            x.amount === STAKE_AMOUNT_NORMALIZED &&
-            new Date(x.created_at).getTime() > MATCH_START
-        );
-        const mapped: Stake[] = inbound.map((x) => ({
-          from: x.from,
-          hash: x.transaction_hash,
-          createdAt: x.created_at,
-          amount: x.amount,
-        }));
-        setStakes(mapped);
-      }
-      setLastRefresh(Date.now());
-    } catch {
-      // ignore transient network errors
-    }
-  }, []);
-
   useEffect(() => {
-    refresh();
-    const id = setInterval(refresh, 10000);
-    return () => clearInterval(id);
-  }, [refresh]);
-
-  async function stake() {
-    if (!isAuthenticated || !wallet?.address) return;
-    if (userHasStaked) {
-      setError("You have already staked in this match.");
+    if (!isAuthenticated || !wallet?.address) {
+      setWalletUsdc(null);
+      setWalletXlm(null);
       return;
     }
+    let cancelled = false;
+
+    const load = async () => {
+      try {
+        const res = await fetch(`${HORIZON_URL}/accounts/${wallet.address}`);
+        if (!res.ok) {
+          if (!cancelled) {
+            setWalletUsdc("0");
+            setWalletXlm("0");
+          }
+          return;
+        }
+        const data = await res.json();
+        const xlm =
+          (data.balances ?? []).find((b: any) => b.asset_type === "native")
+            ?.balance ?? "0";
+        const usdc =
+          (data.balances ?? []).find(
+            (b: any) =>
+              b.asset_code === "USDC" && b.asset_issuer === USDC_ISSUER
+          )?.balance ?? "0";
+        if (!cancelled) {
+          setWalletUsdc(usdc);
+          setWalletXlm(xlm);
+        }
+      } catch {
+        // ignore
+      }
+    };
+
+    load();
+    const id = setInterval(load, 15000);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, [isAuthenticated, wallet?.address]);
+
+  useEffect(() => {
+    if (typeof window !== "undefined") {
+      setX402Public(localStorage.getItem("av_x402_public"));
+    }
+  }, [scoutReport]);
+
+  async function stake(player: "A" | "B") {
+    if (!isAuthenticated || !wallet?.address) return;
+    if (!stakeAmountValid) {
+      setError(
+        `Stake must be between ${MIN_STAKE.toFixed(
+          2
+        )} and ${MAX_STAKE.toFixed(2)} USDC.`
+      );
+      return;
+    }
+    if (!hasEnoughUsdcForStake) {
+      setError(
+        `Wallet has ${usdcNum?.toFixed(2) ?? "0"} USDC. Need at least ${stakeAmount.toFixed(2)}.`
+      );
+      return;
+    }
+    if ((player === "A" && playerAStaked) || (player === "B" && playerBStaked))
+      return;
+
     setBusy(true);
     setError(null);
     try {
       const res: any = await runTx("payment", {
         destination: ESCROW,
-        amount: STAKE,
+        amount: stakeAmount.toFixed(2),
         asset: USDC,
       });
       console.log("[stake] response:", res);
@@ -288,7 +315,10 @@ export default function Home() {
           "Transaction did not return a hash. Response: " + JSON.stringify(res)
         );
       }
-      await refresh();
+      setStakeTxHash(hash);
+      if (!stakeTimestamp) setStakeTimestamp(new Date().toISOString());
+      if (player === "A") setPlayerAStaked(true);
+      else setPlayerBStaked(true);
     } catch (e: any) {
       console.error("[stake] error:", e);
       setError(e?.message ?? String(e));
@@ -314,13 +344,18 @@ export default function Home() {
       setError("Pick a winner before resolving.");
       return;
     }
+    if (!unlocked) {
+      setError("Both players must stake before settlement.");
+      return;
+    }
+    const payoutAmount = stakeAmount * 2;
     setBusy(true);
     setError(null);
     try {
       const res = await fetch("/api/payout", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ destination }),
+        body: JSON.stringify({ destination, amount: payoutAmount }),
       });
       const data = await res.json();
       console.log("[payout] response:", data);
@@ -332,7 +367,6 @@ export default function Home() {
       setPayoutTxHash(data.hash);
       setPayoutDestination(destination);
       setWinnerPaid(true);
-      await refresh();
     } catch (e: any) {
       console.error("[payout] error:", e);
       setError(e?.message ?? String(e));
@@ -341,28 +375,37 @@ export default function Home() {
     }
   }
 
-  function resetLocalState() {
-    setEarnPreviewed(false);
-    setWinnerPaid(false);
-    setPayoutTxHash(null);
-    setPayoutDestination(null);
+  async function loadScoutReport() {
+    setScoutLoading(true);
     setError(null);
-    refresh();
+    try {
+      const response = await x402Fetch("/api/scout", undefined, {
+        payWithStellar: payWithDemoWallet,
+      });
+      if (!response.ok) {
+        throw new Error("Scout fetch failed: " + response.status);
+      }
+      const data = await response.json();
+      setScoutReport(data);
+    } catch (e: any) {
+      console.error("[x402] scout error:", e);
+      setError(e?.message ?? String(e));
+    } finally {
+      setScoutLoading(false);
+    }
   }
 
-  function resetForNewMatch() {
-    const now = new Date().toISOString();
-    try {
-      localStorage.setItem("av_match_start_override", now);
-    } catch {}
+  function resetDemo() {
+    setPlayerAStaked(false);
+    setPlayerBStaked(false);
     setEarnPreviewed(false);
     setWinnerPaid(false);
-    setPayoutTxHash(null);
+    setStakeTxHash(null);
+    setStakeTimestamp(null);
     setPayoutDestination(null);
-    setStakes([]);
-    setEscrowBalance("0");
-    setError("Match start reset to now. Starting fresh.");
-    refresh();
+    setPayoutTxHash(null);
+    setScoutReport(null);
+    setError(null);
   }
 
   async function handleLoginGoogle() {
@@ -378,9 +421,6 @@ export default function Home() {
   async function handleLogout() {
     try {
       await logout();
-    } catch {}
-    try {
-      localStorage.removeItem("av_match_start_override");
     } catch {}
     setScreen("landing");
   }
@@ -503,15 +543,19 @@ export default function Home() {
 
               <div className="mt-12 grid grid-cols-3 gap-6 max-w-md">
                 <div>
-                  <p className="text-2xl font-bold text-emerald-400">10</p>
+                  <p className="text-2xl font-bold text-emerald-400">
+                    {DEFAULT_STAKE.toFixed(2)}
+                  </p>
                   <p className="text-xs text-neutral-500 mt-1">
-                    USDC entry fee
+                    Default entry fee
                   </p>
                 </div>
                 <div>
-                  <p className="text-2xl font-bold text-emerald-400">2%</p>
+                  <p className="text-2xl font-bold text-emerald-400">
+                    {MIN_STAKE.toFixed(2)}
+                  </p>
                   <p className="text-xs text-neutral-500 mt-1">
-                    Settlement fee
+                    Minimum stake
                   </p>
                 </div>
                 <div>
@@ -537,20 +581,16 @@ export default function Home() {
                   Call of Duty: Mobile — 1v1
                 </p>
                 <p className="text-xs text-neutral-500 mb-5">
-                  Entry fee 10.00 USDC per player
+                  Entry fee {DEFAULT_STAKE.toFixed(2)} USDC per player
                 </p>
                 <div className="grid grid-cols-2 gap-3 mb-5">
                   <div className="rounded-xl border border-neutral-800 bg-neutral-900 p-4">
                     <p className="text-sm font-semibold">Player A</p>
-                    <p className="text-xs text-neutral-500">
-                      {playerA ? short(playerA.from, 4) : "Open seat"}
-                    </p>
+                    <p className="text-xs text-neutral-500">Open seat</p>
                   </div>
                   <div className="rounded-xl border border-neutral-800 bg-neutral-900 p-4">
                     <p className="text-sm font-semibold">Player B</p>
-                    <p className="text-xs text-neutral-500">
-                      {playerB ? short(playerB.from, 4) : "Open seat"}
-                    </p>
+                    <p className="text-xs text-neutral-500">Open seat</p>
                   </div>
                 </div>
                 <div className="rounded-xl border border-emerald-900/60 bg-emerald-950/40 px-5 py-4">
@@ -558,12 +598,8 @@ export default function Home() {
                     Total Prize Pool
                   </p>
                   <p className="text-4xl font-bold text-emerald-400 mt-1">
-                    {pool.toFixed(2)}{" "}
+                    {(DEFAULT_STAKE * 2).toFixed(2)}{" "}
                     <span className="text-lg">USDC</span>
-                  </p>
-                  <p className="text-[10px] text-neutral-500 mt-1">
-                    Live escrow balance: {parseFloat(escrowBalance).toFixed(2)}{" "}
-                    USDC
                   </p>
                 </div>
               </div>
@@ -703,53 +739,149 @@ export default function Home() {
 
         {isAuthenticated && (
           <div className="space-y-6">
-            <section className="rounded-xl border border-neutral-800 bg-neutral-900/40 px-5 py-4 flex items-center justify-between gap-4 flex-wrap">
-              <div className="flex items-center gap-3 min-w-0">
-                <div className="h-10 w-10 rounded-full bg-gradient-to-br from-emerald-400 to-indigo-500 flex items-center justify-center text-black font-bold text-xs shrink-0">
-                  {initialsFrom(wallet?.address)}
+            {/* Wallet info */}
+            <section className="rounded-2xl border border-neutral-800 bg-gradient-to-br from-neutral-900 to-neutral-950 p-5">
+              <div className="flex items-start justify-between gap-4 flex-wrap">
+                <div className="flex items-center gap-3 min-w-0">
+                  <div className="h-12 w-12 rounded-full bg-gradient-to-br from-emerald-400 to-indigo-500 flex items-center justify-center text-black font-bold text-sm shrink-0">
+                    {initialsFrom(wallet?.address)}
+                  </div>
+                  <div className="min-w-0">
+                    <p className="text-[10px] uppercase tracking-[0.2em] text-emerald-400">
+                      Connected Wallet
+                    </p>
+                    <p className="font-mono text-neutral-200 text-sm break-all">
+                      {wallet?.address ?? "—"}
+                    </p>
+                  </div>
                 </div>
-                <div className="min-w-0">
-                  <p className="text-[10px] uppercase tracking-[0.2em] text-emerald-400">
-                    Connected Player
+                <div className="flex items-center gap-2 shrink-0">
+                  <button
+                    onClick={openTxHistoryModal}
+                    className="text-xs rounded-md bg-neutral-800 hover:bg-neutral-700 px-3 py-1.5"
+                  >
+                    History
+                  </button>
+                  <button
+                    onClick={openReceiveModal}
+                    className="text-xs rounded-md bg-neutral-800 hover:bg-neutral-700 px-3 py-1.5"
+                  >
+                    Receive
+                  </button>
+                  <button
+                    onClick={handleLogout}
+                    className="text-xs rounded-md bg-red-950/60 hover:bg-red-900/60 border border-red-800/60 text-red-300 px-3 py-1.5"
+                  >
+                    Log out
+                  </button>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-2 gap-3 mt-4">
+                <div className="rounded-xl border border-emerald-900/60 bg-emerald-950/30 p-4">
+                  <p className="text-[10px] uppercase tracking-[0.2em] text-emerald-500">
+                    USDC Balance
                   </p>
-                  <p className="font-mono text-neutral-300 text-sm truncate">
-                    {wallet?.address ?? "—"}
+                  <p className="text-2xl font-bold text-emerald-400 tabular-nums mt-1">
+                    {walletUsdc === null
+                      ? "…"
+                      : parseFloat(walletUsdc).toFixed(2)}
+                    <span className="text-sm text-emerald-600/80 ml-1">
+                      USDC
+                    </span>
+                  </p>
+                  <p className="text-[10px] text-neutral-500 mt-1">
+                    Need {stakeAmount.toFixed(2)} USDC per stake
+                  </p>
+                </div>
+                <div className="rounded-xl border border-neutral-800 bg-neutral-900/60 p-4">
+                  <p className="text-[10px] uppercase tracking-[0.2em] text-neutral-500">
+                    XLM Balance
+                  </p>
+                  <p className="text-2xl font-bold text-neutral-200 tabular-nums mt-1">
+                    {walletXlm === null
+                      ? "…"
+                      : parseFloat(walletXlm).toFixed(2)}
+                    <span className="text-sm text-neutral-500 ml-1">XLM</span>
+                  </p>
+                  <p className="text-[10px] text-neutral-500 mt-1">
+                    Need 2.00+ XLM for network fees
                   </p>
                 </div>
               </div>
-              <div className="flex items-center gap-2 shrink-0">
-                <button
-                  onClick={openTxHistoryModal}
-                  className="text-xs rounded-md bg-neutral-800 hover:bg-neutral-700 px-3 py-1.5"
-                >
-                  History
-                </button>
-                <button
-                  onClick={openReceiveModal}
-                  className="text-xs rounded-md bg-neutral-800 hover:bg-neutral-700 px-3 py-1.5"
-                >
-                  Receive
-                </button>
-                <button
-                  onClick={handleLogout}
-                  className="text-xs rounded-md bg-red-950/60 hover:bg-red-900/60 border border-red-800/60 text-red-300 px-3 py-1.5"
-                >
-                  Log out
-                </button>
-              </div>
+
+              {usdcNum !== null && usdcNum < stakeAmount && (
+                <div className="mt-3 rounded-lg border border-amber-800/60 bg-amber-950/30 px-3 py-2 text-xs text-amber-300">
+                  ⚠ Not enough USDC. Fund this wallet via{" "}
+                  <a
+                    href="https://faucet.circle.com"
+                    target="_blank"
+                    rel="noreferrer"
+                    className="underline"
+                  >
+                    faucet.circle.com
+                  </a>{" "}
+                  → Stellar Testnet → paste the address above.
+                </div>
+              )}
+              {walletXlm !== null && parseFloat(walletXlm) < 2 && (
+                <div className="mt-3 rounded-lg border border-amber-800/60 bg-amber-950/30 px-3 py-2 text-xs text-amber-300">
+                  ⚠ Low XLM. Run the friendbot fund script before staking.
+                </div>
+              )}
             </section>
 
+            {/* Stake amount */}
+            <section className="rounded-2xl border border-neutral-800 bg-neutral-900 p-5">
+              <div className="flex items-end justify-between gap-4 flex-wrap">
+                <div className="flex-1 min-w-[180px]">
+                  <p className="text-xs uppercase tracking-widest text-emerald-400 mb-2">
+                    Entry Fee
+                  </p>
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="number"
+                      min={MIN_STAKE}
+                      max={MAX_STAKE}
+                      step="0.1"
+                      value={stakeInput}
+                      onChange={(e) => setStakeInput(e.target.value)}
+                      disabled={playerAStaked || playerBStaked}
+                      className="w-32 bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-2 text-lg font-mono text-neutral-100 disabled:opacity-50"
+                    />
+                    <span className="text-neutral-400 text-sm">USDC</span>
+                  </div>
+                  <p className="text-[10px] text-neutral-500 mt-2">
+                    Min {MIN_STAKE.toFixed(2)} · Max {MAX_STAKE.toFixed(2)} ·
+                    Stakes lock when both players pay
+                  </p>
+                </div>
+                <div className="text-right">
+                  <p className="text-xs uppercase tracking-widest text-neutral-500">
+                    Pool if both stake
+                  </p>
+                  <p className="text-2xl font-bold text-emerald-400 tabular-nums">
+                    {(stakeAmount * 2).toFixed(2)} USDC
+                  </p>
+                </div>
+              </div>
+              {!stakeAmountValid && (
+                <p className="mt-3 text-xs text-red-300">
+                  Stake must be between {MIN_STAKE.toFixed(2)} and{" "}
+                  {MAX_STAKE.toFixed(2)} USDC.
+                </p>
+              )}
+            </section>
+
+            {/* Admin */}
             {adminView && (
               <section className="rounded-2xl border border-indigo-900/60 bg-indigo-950/20 p-5">
                 <div className="flex items-center justify-between mb-3">
                   <p className="text-xs uppercase tracking-widest text-indigo-400">
                     Organizer panel
                   </p>
-                  <span className="text-xs text-neutral-500 capitalize">
-                    Phase: {phase} · refreshed{" "}
-                    {lastRefresh
-                      ? Math.floor((Date.now() - lastRefresh) / 1000) + "s ago"
-                      : "—"}
+                  <span className="text-xs text-neutral-500">
+                    {unlocked ? "Ready to settle" : "Waiting for stakes"}
                   </span>
                 </div>
 
@@ -766,9 +898,6 @@ export default function Home() {
                     >
                       {ESCROW}
                     </a>
-                    <p className="text-xs text-neutral-400 mt-2">
-                      Balance: {parseFloat(escrowBalance).toFixed(2)} USDC
-                    </p>
                   </div>
                   <div className="rounded-lg border border-neutral-800 bg-neutral-900/60 p-3">
                     <p className="text-xs text-neutral-500 mb-1">
@@ -782,14 +911,9 @@ export default function Home() {
                       }
                     >
                       <option value="">— pick winner —</option>
-                      {playerA && (
-                        <option value={playerA.from}>
-                          Player A · {short(playerA.from)}
-                        </option>
-                      )}
-                      {playerB && (
-                        <option value={playerB.from}>
-                          Player B · {short(playerB.from)}
+                      {wallet?.address && (
+                        <option value={wallet.address}>
+                          Current wallet · {short(wallet.address)}
                         </option>
                       )}
                       <option value={FALLBACK_WINNER}>
@@ -802,27 +926,24 @@ export default function Home() {
                 <div className="flex flex-wrap gap-2">
                   <button
                     onClick={() => resolveWinner(payoutDestination)}
-                    disabled={busy || winnerPaid || !payoutDestination}
+                    disabled={
+                      busy || winnerPaid || !payoutDestination || !unlocked
+                    }
                     className="text-xs rounded-md bg-indigo-500 hover:bg-indigo-400 disabled:bg-neutral-800 disabled:text-neutral-600 text-white font-semibold px-3 py-1.5"
                   >
-                    Resolve payout
+                    Resolve payout ({(stakeAmount * 2).toFixed(2)} USDC)
                   </button>
                   <button
-                    onClick={resetForNewMatch}
-                    className="text-xs rounded-md bg-emerald-500 hover:bg-emerald-400 text-black font-semibold px-3 py-1.5"
-                  >
-                    Reset for new match
-                  </button>
-                  <button
-                    onClick={resetLocalState}
+                    onClick={resetDemo}
                     className="text-xs rounded-md bg-neutral-800 hover:bg-neutral-700 px-3 py-1.5"
                   >
-                    Refresh state
+                    Reset demo
                   </button>
                 </div>
               </section>
             )}
 
+            {/* Match */}
             <section className="rounded-2xl border border-neutral-800 bg-gradient-to-br from-neutral-900 to-neutral-950 p-6">
               <div className="flex items-center justify-between mb-4">
                 <span className="text-xs uppercase tracking-widest text-emerald-400">
@@ -832,56 +953,126 @@ export default function Home() {
                   Call of Duty: Mobile · Stellar Testnet
                 </span>
               </div>
-              <h2 className="text-2xl font-bold">1v1 — Entry 10 USDC</h2>
+              <h2 className="text-2xl font-bold">
+                1v1 — Entry {stakeAmount.toFixed(2)} USDC
+              </h2>
               <p className="text-neutral-500 text-sm mt-1">
                 Winner takes the pool + accrued yield
               </p>
               <div className="mt-6 grid grid-cols-2 gap-4">
                 <PlayerCard
                   name="Player A"
-                  address={playerA?.from ?? null}
-                  staked={!!playerA}
-                  disabled={busy || userHasStaked || !isAuthenticated}
-                  busy={busy && !userHasStaked}
-                  state={stakeStateA}
-                  isCurrentUser={isPlayerA}
-                  onStake={stake}
+                  address={playerAStaked ? wallet?.address ?? null : null}
+                  staked={playerAStaked}
+                  disabled={busy || playerAStaked || !stakeAmountValid}
+                  busy={busy && !playerAStaked}
+                  state={playerAStaked ? "done" : busy ? "pending" : "idle"}
+                  amount={stakeAmount}
+                  onStake={() => stake("A")}
                 />
                 <PlayerCard
                   name="Player B"
-                  address={playerB?.from ?? null}
-                  staked={!!playerB}
-                  disabled={busy || userHasStaked || !isAuthenticated}
-                  busy={busy && !userHasStaked}
-                  state={stakeStateB}
-                  isCurrentUser={isPlayerB}
-                  onStake={stake}
+                  address={playerBStaked ? wallet?.address ?? null : null}
+                  staked={playerBStaked}
+                  disabled={busy || playerBStaked || !stakeAmountValid}
+                  busy={busy && !playerBStaked}
+                  state={playerBStaked ? "done" : busy ? "pending" : "idle"}
+                  amount={stakeAmount}
+                  onStake={() => stake("B")}
                 />
               </div>
-              {!userHasStaked && isAuthenticated && !unlocked && (
-                <p className="text-xs text-neutral-500 mt-4 text-center">
-                  Open this page in an incognito window and sign in with a
-                  different Google account to fill the second seat.
-                </p>
-              )}
             </section>
 
             <TournamentTerms
               unlocked={unlocked}
               winnerAddress={
-                payoutDestination || playerA?.from || FALLBACK_WINNER
+                payoutDestination || wallet?.address || FALLBACK_WINNER
               }
               escrowAddress={ESCROW}
-              stakeTimestamp={playerA?.createdAt ?? null}
-              stakeTxHash={playerA?.hash ?? null}
+              stakeTimestamp={stakeTimestamp}
+              stakeTxHash={stakeTxHash}
               payoutTxHash={payoutTxHash}
+              stakeAmount={stakeAmount}
             />
 
+            {/* x402 Scout Report */}
+            <section className="rounded-2xl border border-neutral-800 bg-gradient-to-br from-neutral-900 to-neutral-950 p-6">
+              <div className="flex items-start justify-between gap-4 flex-wrap mb-4">
+                <div>
+                  <p className="text-xs uppercase tracking-widest text-emerald-400">
+                    Opponent Scouting Report
+                  </p>
+                  <p className="text-neutral-500 text-xs mt-1">
+                    x402 micropayment · $0.001 USDC per request
+                  </p>
+                </div>
+                {!scoutReport && (
+                  <button
+                    onClick={loadScoutReport}
+                    disabled={scoutLoading}
+                    className="rounded-lg bg-emerald-500 hover:bg-emerald-400 disabled:bg-neutral-800 disabled:text-neutral-600 text-black font-semibold px-4 py-2 text-sm"
+                  >
+                    {scoutLoading ? "Paying $0.001…" : "Unlock scout report"}
+                  </button>
+                )}
+              </div>
+
+              {x402Public && !scoutReport && (
+                <p className="text-[10px] text-neutral-500 mb-3 font-mono break-all">
+                  x402 payer wallet: {x402Public}
+                  <br />
+                  Fund USDC at faucet.circle.com · Fund XLM at
+                  friendbot.stellar.org?addr={x402Public}
+                </p>
+              )}
+
+              {scoutReport ? (
+                <div className="space-y-2 text-sm">
+                  <div className="flex justify-between border-b border-neutral-800 pb-2">
+                    <span className="text-neutral-500">Opponent</span>
+                    <span className="text-neutral-200">
+                      {scoutReport.opponent}
+                    </span>
+                  </div>
+                  <div className="flex justify-between border-b border-neutral-800 pb-2">
+                    <span className="text-neutral-500">Avg K/D</span>
+                    <span className="text-neutral-200">
+                      {scoutReport.avgKd}
+                    </span>
+                  </div>
+                  <div className="flex justify-between border-b border-neutral-800 pb-2">
+                    <span className="text-neutral-500">Playstyle</span>
+                    <span className="text-neutral-200 text-right max-w-[60%]">
+                      {scoutReport.playstyle}
+                    </span>
+                  </div>
+                  <div className="flex justify-between border-b border-neutral-800 pb-2">
+                    <span className="text-neutral-500">Weak rounds</span>
+                    <span className="text-neutral-200 text-right max-w-[60%]">
+                      {scoutReport.weakRounds.join(" · ")}
+                    </span>
+                  </div>
+                  <p className="text-xs text-emerald-400 pt-2 border-t border-neutral-800">
+                    {scoutReport.recommendation}
+                  </p>
+                  <p className="text-[10px] text-neutral-600 mt-2">
+                    Paid via x402 · HTTP 402 → payment → retry → 200 OK
+                  </p>
+                </div>
+              ) : (
+                <p className="text-xs text-neutral-500">
+                  Unlock to see opponent weak rounds, playstyle, and a
+                  recommended strategy. Paid per request — no subscription.
+                </p>
+              )}
+            </section>
+
+            {/* Pool */}
             <section className="rounded-2xl border border-emerald-900/60 bg-gradient-to-br from-emerald-950/40 to-neutral-950 p-6">
               <div className="flex items-end justify-between gap-6 flex-wrap">
                 <div>
                   <p className="text-xs uppercase tracking-widest text-emerald-500 flex items-center gap-2">
-                    <StatusDot state={earnState} />
+                    <StatusDot state={earnPreviewed ? "done" : "idle"} />
                     Total Prize Pool
                   </p>
                   <p className="text-6xl font-bold mt-2 text-emerald-400 tabular-nums">
@@ -890,8 +1081,7 @@ export default function Home() {
                   </p>
                   <p className="text-xs text-neutral-500 mt-2">
                     Held in escrow: {ESCROW.slice(0, 6)}…
-                    {ESCROW.slice(-6)} ·{" "}
-                    {parseFloat(escrowBalance).toFixed(2)} USDC on-chain
+                    {ESCROW.slice(-6)}
                   </p>
                 </div>
                 <button
@@ -910,25 +1100,23 @@ export default function Home() {
               )}
             </section>
 
+            {/* Settlement */}
             <section className="rounded-2xl border border-neutral-800 bg-neutral-900 p-6">
               <div className="flex items-center justify-between gap-6 flex-wrap">
                 <div>
                   <p className="text-xs uppercase tracking-widest text-neutral-500 flex items-center gap-2">
-                    <StatusDot state={settleState} />
+                    <StatusDot state={winnerPaid ? "done" : "idle"} />
                     Settlement
                   </p>
-                  <p className="text-neutral-300 text-sm mt-1 flex items-center gap-2">
+                  <p className="text-neutral-300 text-sm mt-1">
                     {winnerPaid && payoutDestination
-                      ? "Paid to " + short(payoutDestination, 4)
+                      ? "Paid " +
+                        (stakeAmount * 2).toFixed(2) +
+                        " USDC to " +
+                        short(payoutDestination, 4)
                       : unlocked
                       ? "Ready — pick winner in Admin panel"
                       : "Waiting for both stakes"}
-                    {busy && !winnerPaid && (
-                      <span className="inline-flex items-center gap-1 text-xs text-amber-400">
-                        <span className="h-1.5 w-1.5 rounded-full bg-amber-400 animate-pulse" />
-                        submitting
-                      </span>
-                    )}
                   </p>
                 </div>
                 <button
@@ -944,38 +1132,23 @@ export default function Home() {
               </div>
             </section>
 
-            {(playerA?.hash || payoutTxHash) && (
+            {(stakeTxHash || payoutTxHash) && (
               <section className="rounded-2xl border border-emerald-800 bg-emerald-950/30 p-6 space-y-3">
                 <p className="text-xs uppercase tracking-widest text-emerald-400">
                   On-chain proof
                 </p>
-                {playerA?.hash && (
+                {stakeTxHash && (
                   <div>
                     <p className="text-xs text-neutral-500 mb-1">
-                      Player A stake ({short(playerA.from)})
+                      Stake settlement
                     </p>
                     <a
                       className="text-emerald-300 font-mono text-xs break-all underline"
-                      href={explorerTx(playerA.hash)}
+                      href={explorerTx(stakeTxHash)}
                       target="_blank"
                       rel="noreferrer"
                     >
-                      {playerA.hash}
-                    </a>
-                  </div>
-                )}
-                {playerB?.hash && (
-                  <div>
-                    <p className="text-xs text-neutral-500 mb-1">
-                      Player B stake ({short(playerB.from)})
-                    </p>
-                    <a
-                      className="text-emerald-300 font-mono text-xs break-all underline"
-                      href={explorerTx(playerB.hash)}
-                      target="_blank"
-                      rel="noreferrer"
-                    >
-                      {playerB.hash}
+                      {stakeTxHash}
                     </a>
                   </div>
                 )}
