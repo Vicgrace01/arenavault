@@ -50,8 +50,9 @@ export async function POST() {
       to: destination,
       amount: PRIZE,
     });
-  } catch (e) {
-    const detail = (e && e.response && e.response.data) || (e && e.message) || String(e);
+  } catch (e: any) {
+    const detail =
+      (e && e.response && e.response.data) || (e && e.message) || String(e);
     return NextResponse.json(
       { error: "Payout failed", detail },
       { status: 500 }
